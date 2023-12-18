@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import logging
+import re
 from contextvars import ContextVar
 from io import BytesIO
 
@@ -20,7 +21,7 @@ from telegram.ext import (
 )
 
 generation_config = {
-    "temperature": 0.9,
+    "temperature": 0.7,
     "top_p": 1,
     "top_k": 1,
     "max_output_tokens": 2048,
@@ -44,6 +45,102 @@ safety_settings = [
 placehold_message = ContextVar("placehold_message")
 
 
+# Note this code copy from https://github.com/yym68686/md2tgmd/blob/main/src/md2tgmd.py
+# great thanks
+def find_all_index(str, pattern):
+    index_list = [0]
+    for match in re.finditer(pattern, str, re.MULTILINE):
+        if match.group(1) != None:
+            start = match.start(1)
+            end = match.end(1)
+            index_list += [start, end]
+    index_list.append(len(str))
+    return index_list
+
+
+def replace_all(text, pattern, function):
+    poslist = [0]
+    strlist = []
+    originstr = []
+    poslist = find_all_index(text, pattern)
+    for i in range(1, len(poslist[:-1]), 2):
+        start, end = poslist[i : i + 2]
+        strlist.append(function(text[start:end]))
+    for i in range(0, len(poslist), 2):
+        j, k = poslist[i : i + 2]
+        originstr.append(text[j:k])
+    if len(strlist) < len(originstr):
+        strlist.append("")
+    else:
+        originstr.append("")
+    new_list = [item for pair in zip(originstr, strlist) for item in pair]
+    return "".join(new_list)
+
+
+def escapeshape(text):
+    return "▎*" + text.split()[1] + "*"
+
+
+def escapeminus(text):
+    return "\\" + text
+
+
+def escapebackquote(text):
+    return r"\`\`"
+
+
+def escapeplus(text):
+    return "\\" + text
+
+
+def escape(text, flag=0):
+    # In all other places characters
+    # _ * [ ] ( ) ~ ` > # + - = | { } . !
+    # must be escaped with the preceding character '\'.
+    text = re.sub(r"\\\[", "@->@", text)
+    text = re.sub(r"\\\]", "@<-@", text)
+    text = re.sub(r"\\\(", "@-->@", text)
+    text = re.sub(r"\\\)", "@<--@", text)
+    if flag:
+        text = re.sub(r"\\\\", "@@@", text)
+    text = re.sub(r"\\", r"\\\\", text)
+    if flag:
+        text = re.sub(r"\@{3}", r"\\\\", text)
+    text = re.sub(r"_", r"\_", text)
+    text = re.sub(r"\*{2}(.*?)\*{2}", "@@@\\1@@@", text)
+    text = re.sub(r"\n{1,2}\*\s", "\n\n• ", text)
+    text = re.sub(r"\*", r"\*", text)
+    text = re.sub(r"\@{3}(.*?)\@{3}", "*\\1*", text)
+    text = re.sub(r"\!?\[(.*?)\]\((.*?)\)", "@@@\\1@@@^^^\\2^^^", text)
+    text = re.sub(r"\[", r"\[", text)
+    text = re.sub(r"\]", r"\]", text)
+    text = re.sub(r"\(", r"\(", text)
+    text = re.sub(r"\)", r"\)", text)
+    text = re.sub(r"\@\-\>\@", r"\[", text)
+    text = re.sub(r"\@\<\-\@", r"\]", text)
+    text = re.sub(r"\@\-\-\>\@", r"\(", text)
+    text = re.sub(r"\@\<\-\-\@", r"\)", text)
+    text = re.sub(r"\@{3}(.*?)\@{3}\^{3}(.*?)\^{3}", "[\\1](\\2)", text)
+    text = re.sub(r"~", r"\~", text)
+    text = re.sub(r">", r"\>", text)
+    text = replace_all(text, r"(^#+\s.+?$)|```[\D\d\s]+?```", escapeshape)
+    text = re.sub(r"#", r"\#", text)
+    text = replace_all(text, r"(\+)|\n[\s]*-\s|```[\D\d\s]+?```|`[\D\d\s]*?`", escapeplus)
+    text = re.sub(r"\n{1,2}(\s*)-\s", "\n\n\\1• ", text)
+    text = re.sub(r"\n{1,2}(\s*\d{1,2}\.\s)", "\n\n\\1", text)
+    text = replace_all(text, r"(-)|\n[\s]*-\s|```[\D\d\s]+?```|`[\D\d\s]*?`", escapeminus)
+    text = re.sub(r"```([\D\d\s]+?)```", "@@@\\1@@@", text)
+    text = replace_all(text, r"(``)", escapebackquote)
+    text = re.sub(r"\@{3}([\D\d\s]+?)\@{3}", "```\\1```", text)
+    text = re.sub(r"=", r"\=", text)
+    text = re.sub(r"\|", r"\|", text)
+    text = re.sub(r"{", r"\{", text)
+    text = re.sub(r"}", r"\}", text)
+    text = re.sub(r"\.", r"\.", text)
+    text = re.sub(r"!", r"\!", text)
+    return text
+
+
 def make_new_gemini_convo():
     model = genai.GenerativeModel(
         model_name="gemini-pro",
@@ -58,6 +155,7 @@ async def post_init(application: Application):
     await application.bot.set_my_commands(
         [
             BotCommand("clear", "Clear conversation history"),
+            BotCommand("gemini", "Start conversation with Gemini"),
         ]
     )
 
@@ -103,10 +201,10 @@ async def stream_msg(update: Update, context: CallbackContext, response):
             answer = answer[:4096]  # telegram message length limit
             try:
                 await context.bot.edit_message_text(
-                    answer,
+                    escape(answer),
                     chat_id=message.chat_id,
                     message_id=message.message_id,
-                    parse_mode=ParseMode.MARKDOWN,
+                    parse_mode=ParseMode.MARKDOWN_V2,
                 )
             except telegram.error.BadRequest as e:
                 if not str(e).startswith("Message is not modified"):
@@ -126,24 +224,23 @@ async def stream_msg(update: Update, context: CallbackContext, response):
 async def message_handler(update: Update, context: CallbackContext, message=None):
     # check if bot was mentioned (for group chats)
     if not await is_bot_mentioned(update, context):
-        return
+        return None
 
     # check if message is edited
     if update.edited_message is not None:
         await edited_message_handle(update, context)
-        return
+        return None
 
-    text = message or update.message.text
+    text = message or update.message.text.split('/gemini', 1)[-1].strip()
 
     # remove bot mention (in group chats)
     if update.message.chat.type != "private":
         text = text.replace("@" + context.bot.username, "").strip()
 
-    if text is None or len(text) == 0:
-        await update.message.reply_text(
-            "🥲 You sent <b>empty message</b>. Please, try again!", parse_mode=ParseMode.HTML
+    if not text or len(text) == 0:
+        return await update.message.reply_text(
+            escape("🥲 You sent **empty message**. Please reply me with any text."), parse_mode=ParseMode.MARKDOWN_V2
         )
-        return
     player = gemini_player_dict.setdefault(update.message.from_user.id, make_new_gemini_convo())
     try:
         response = await player.send_message_async(text, stream=True)
@@ -164,8 +261,7 @@ async def photo_handler(update: Update, context: CallbackContext):
             await file.download_to_memory(bio)
             img = bio.getvalue()
     except Exception as e:
-        await update.message.reply_text(f"🥲 Something is wrong while reading your photo: {e}")
-        return
+        return await update.message.reply_text(f"🥲 Something is wrong while reading your photo: {e}")
     model = genai.GenerativeModel("gemini-pro-vision")
     contents = {
         "parts": [
@@ -205,6 +301,7 @@ def main():
         .build()
     )
     app.add_handler(CommandHandler("clear", clear_handler))
+    app.add_handler(CommandHandler("gemini", message_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     app.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, photo_handler))
     app.run_polling()
